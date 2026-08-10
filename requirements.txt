@@ -1,0 +1,5 @@
+pandas==2.3.3
+numpy==2.3.5
+scikit-learn==1.9.0
+
+# Testado com Python 3.14. Deve funcionar em Python >= 3.10, mas sem teste formal nessas versoes.
