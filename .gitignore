@@ -1,0 +1,22 @@
+# Dados públicos e saídas reproduzíveis
+/base_cadastral.csv
+/base_info.csv
+/base_pagamentos_desenvolvimento.csv
+/base_pagamentos_teste.csv
+/submissao_case.csv
+/data/
+
+# Ambientes e caches Python
+/.venv/
+/venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Editores e sistema operacional
+/.idea/
+/.vscode/
+.DS_Store
+Thumbs.db
