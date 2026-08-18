@@ -161,13 +161,50 @@ Para reproduzir também os experimentos de balanceamento e calibração:
 python solution.py --extended
 ```
 
+## Integração com Supabase
+
+A integração é opcional e mantém o fluxo padrão inalterado. Quando ativada, registra uma execução em `prediction_runs` e envia todas as probabilidades para `credit_risk_predictions`, preservando a ordem original da submissão.
+
+### Configuração
+
+1. Crie as tabelas executando [`supabase/schema.sql`](supabase/schema.sql) no SQL Editor do projeto Supabase. O script ativa RLS, remove acesso de `anon` e `authenticated` e concede acesso somente a `service_role`.
+2. Copie `.env.example` para `.env` e preencha os valores do seu projeto:
+
+   ```bash
+   cp .env.example .env
+   ```
+
+   ```dotenv
+   SUPABASE_URL=https://your-project-ref.supabase.co
+   SUPABASE_SECRET_KEY=sb_secret_your_secret_key
+   ```
+
+3. Execute o pipeline com o envio habilitado:
+
+   ```bash
+   python solution.py --upload-supabase
+   ```
+
+O envio acontece somente depois que o CSV passa pelas validações de linhas, colunas, valores nulos e intervalo das probabilidades. As inserções são feitas em lotes e cada execução recebe um UUID próprio.
+
+### Segurança
+
+- `.env` e suas variações estão no `.gitignore`; apenas `.env.example`, sem valores reais, é versionado.
+- Use preferencialmente uma chave moderna `sb_secret_*`. A chave legada `service_role` também funciona no script local.
+- Nunca use essa chave em frontend, notebook público, commit, log ou variável com prefixo público.
+- As tabelas têm RLS habilitada e não possuem políticas para acesso público. Uma chave publishable/anon é rejeitada pelo próprio script.
+
 ## Estrutura
 
 ```text
 .
+├── .env.example
 ├── README.md
 ├── requirements.txt
-└── solution.py
+├── solution.py
+├── supabase_io.py
+└── supabase/
+    └── schema.sql
 ```
 
 As bases e o arquivo de submissão não são versionados. Eles já estão disponíveis publicamente na fonte oficial ou podem ser reproduzidos pela execução do código.

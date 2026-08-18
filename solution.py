@@ -13,6 +13,7 @@ Executa a solucao de ponta a ponta:
 Uso:
     python solution.py             # grid padrao (~1-2 min)
     python solution.py --extended  # tambem reproduz peso balanceado e calibracao (~5 min)
+    python solution.py --upload-supabase  # salva a submissao e publica as previsoes
 """
 
 from __future__ import annotations
@@ -580,6 +581,14 @@ def parse_args() -> argparse.Namespace:
             "documentados no README."
         ),
     )
+    parser.add_argument(
+        "--upload-supabase",
+        action="store_true",
+        help=(
+            "Publica a execucao e as previsoes no Supabase depois de validar o CSV. "
+            "Requer SUPABASE_URL e SUPABASE_SECRET_KEY no ambiente ou em .env."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -635,6 +644,12 @@ def main() -> None:
     submission["PROBABILIDADE_INADIMPLENCIA"] = submission["PROBABILIDADE_INADIMPLENCIA"].clip(0, 1)
     submission.to_csv(OUTPUT_FILE, sep=";", index=False)
     validate_submission(submission, expected_rows=len(pagamentos_teste))
+
+    if args.upload_supabase:
+        from supabase_io import upload_predictions
+
+        run_id = upload_predictions(submission, model_name=best_name, metrics=best_metrics)
+        print(f"Previsoes publicadas no Supabase. Run ID: {run_id}")
 
     print(f"\nModelo escolhido: {best_name}")
     print(f"Brier validacao: {best_metrics['brier']:.4f} | AUC validacao: {best_metrics['auc']:.4f}")
