@@ -6,6 +6,11 @@
 /submissao_case.csv
 /data/
 
+# Credenciais locais (nunca versionar)
+.env
+.env.*
+!.env.example
+
 # Ambientes e caches Python
 /.venv/
 /venv/
