@@ -32,7 +32,8 @@ from sklearn.ensemble import HistGradientBoostingClassifier
 from sklearn.impute import SimpleImputer
 from sklearn.inspection import permutation_importance
 from sklearn.linear_model import LogisticRegression
-from sklearn.metrics import brier_score_loss, roc_auc_score
+from sklearn.metrics import average_precision_score, brier_score_loss, log_loss, roc_auc_score, roc_curve
+from sklearn.model_selection import TimeSeriesSplit
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import OneHotEncoder, StandardScaler
 
@@ -42,6 +43,22 @@ OUTPUT_FILE = BASE_DIR / "submissao_case.csv"
 RANDOM_STATE = 42
 LIMIAR_ATRASO_DIAS = 5
 VALIDATION_MONTHS = ("2021-03", "2021-04", "2021-05", "2021-06")
+
+REQUIRED_COLUMNS = {
+    "base_cadastral": {
+        "ID_CLIENTE", "DATA_CADASTRO", "DDD", "FLAG_PF", "SEGMENTO_INDUSTRIAL",
+        "DOMINIO_EMAIL", "PORTE", "CEP_2_DIG",
+    },
+    "base_info": {"ID_CLIENTE", "SAFRA_REF", "RENDA_MES_ANTERIOR", "NO_FUNCIONARIOS"},
+    "pagamentos_dev": {
+        "ID_CLIENTE", "SAFRA_REF", "DATA_EMISSAO_DOCUMENTO", "DATA_PAGAMENTO",
+        "DATA_VENCIMENTO", "VALOR_A_PAGAR", "TAXA",
+    },
+    "pagamentos_teste": {
+        "ID_CLIENTE", "SAFRA_REF", "DATA_EMISSAO_DOCUMENTO", "DATA_VENCIMENTO",
+        "VALOR_A_PAGAR", "TAXA",
+    },
+}
 
 HGB_CONFIGS = [
     {"max_leaf_nodes": 31, "min_samples_leaf": 20, "learning_rate": 0.05, "max_iter": 180},
@@ -76,19 +93,55 @@ def load_data(base_dir: Path = BASE_DIR) -> tuple[pd.DataFrame, pd.DataFrame, pd
         sep=";",
         parse_dates=["DATA_EMISSAO_DOCUMENTO", "DATA_VENCIMENTO"],
     )
+    validate_input_data(cadastral, info, pagamentos_dev, pagamentos_teste)
     return cadastral, info, pagamentos_dev, pagamentos_teste
 
 
+def validate_input_data(
+    cadastral: pd.DataFrame,
+    info: pd.DataFrame,
+    pagamentos_dev: pd.DataFrame,
+    pagamentos_teste: pd.DataFrame,
+) -> None:
+    """Falha cedo quando esquema, chaves dimensionais ou datas essenciais mudam."""
+    tables = {
+        "base_cadastral": cadastral,
+        "base_info": info,
+        "pagamentos_dev": pagamentos_dev,
+        "pagamentos_teste": pagamentos_teste,
+    }
+    for name, table in tables.items():
+        missing = REQUIRED_COLUMNS[name] - set(table.columns)
+        if missing:
+            raise ValueError(f"{name}: colunas obrigatorias ausentes: {sorted(missing)}")
+
+    if cadastral.duplicated("ID_CLIENTE").any():
+        raise ValueError("base_cadastral: ID_CLIENTE deve ser unico")
+    if info.duplicated(["ID_CLIENTE", "SAFRA_REF"]).any():
+        raise ValueError("base_info: (ID_CLIENTE, SAFRA_REF) deve ser unico")
+
+    for name, table, date_columns in [
+        ("pagamentos_dev", pagamentos_dev, ["DATA_EMISSAO_DOCUMENTO", "DATA_VENCIMENTO", "DATA_PAGAMENTO"]),
+        ("pagamentos_teste", pagamentos_teste, ["DATA_EMISSAO_DOCUMENTO", "DATA_VENCIMENTO"]),
+    ]:
+        null_dates = table[date_columns].isna().sum()
+        if null_dates.any():
+            details = null_dates[null_dates > 0].to_dict()
+            raise ValueError(f"{name}: datas essenciais ausentes: {details}")
+
+
 def filter_datas_inconsistentes(pagamentos_dev: pd.DataFrame) -> pd.DataFrame:
-    """Remove do desenvolvimento cobrancas com DATA_VENCIMENTO claramente inconsistente
-    com DATA_EMISSAO_DOCUMENTO (prazo negativo ou maior que 400 dias -- mesmo criterio
-    do PRAZO_ATIPICO usado como feature).
+    """Remove cobrancas cujo target depende de uma sequencia de datas impossivel.
+
+    Sao inconsistentes: vencimento anterior a emissao, prazo superior a 400 dias ou
+    pagamento anterior a emissao. O teste nao e filtrado porque precisa manter todas
+    as linhas da submissao.
 
     Motivo: nessas linhas o ATRASO_DIAS (e portanto o rotulo INADIMPLENTE) e calculado
     sobre uma data quase certamente errada (ex.: erro de digitacao no ano). Isso nao e
-    so um problema de feature: e um problema de ROTULO. Evidencia no desenvolvimento:
-    essas linhas tem taxa de inadimplencia de ~59%, contra ~7% da base geral -- um
-    padrao consistente com ruido de digitacao, nao com comportamento real de credito.
+    so um problema de feature: e um problema de ROTULO. Foram encontrados 51 prazos
+    emissao-vencimento invalidos e 26 pagamentos anteriores a emissao (6 linhas se
+    sobrepoem), um padrao consistente com ruido de digitacao.
     Sem esse filtro, alem do rotulo da propria linha vir errado, os agregados
     historicos (TAXA_INADIMPLENCIA_HIST, ATRASO_MEDIO_HIST etc.) de safras futuras do
     mesmo cliente tambem ficariam contaminados por esses valores extremos.
@@ -103,12 +156,13 @@ def filter_datas_inconsistentes(pagamentos_dev: pd.DataFrame) -> pd.DataFrame:
     ordem em que roda de fato.
     """
     prazo = (pagamentos_dev["DATA_VENCIMENTO"] - pagamentos_dev["DATA_EMISSAO_DOCUMENTO"]).dt.days
-    atipico = (prazo < 0) | (prazo > 400)
+    pagamento_antes_emissao = pagamentos_dev["DATA_PAGAMENTO"] < pagamentos_dev["DATA_EMISSAO_DOCUMENTO"]
+    atipico = (prazo < 0) | (prazo > 400) | pagamento_antes_emissao
     removidas = int(atipico.sum())
     if removidas:
         print(
-            f"\nRemovendo {removidas} cobranca(s) do desenvolvimento com prazo "
-            f"emissao-vencimento inconsistente (<0 ou >400 dias) -- rotulo nao confiavel."
+            f"\nRemovendo {removidas} cobranca(s) do desenvolvimento com "
+            "sequencia de datas inconsistente -- rotulo nao confiavel."
         )
     return pagamentos_dev.loc[~atipico].copy()
 
@@ -129,14 +183,10 @@ def build_target(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def ks_statistic(y_true: pd.Series, y_score: np.ndarray) -> float:
-    scored = pd.DataFrame({"y": y_true.to_numpy(), "score": y_score}).sort_values("score", ascending=False)
-    total_bad = scored["y"].sum()
-    total_good = len(scored) - total_bad
-    if total_bad == 0 or total_good == 0:
+    if pd.Series(y_true).nunique() < 2:
         return float("nan")
-    cum_bad = scored["y"].cumsum() / total_bad
-    cum_good = (1 - scored["y"]).cumsum() / total_good
-    return float((cum_bad - cum_good).abs().max())
+    false_positive_rate, true_positive_rate, _ = roc_curve(y_true, y_score)
+    return float(np.max(np.abs(true_positive_rate - false_positive_rate)))
 
 
 def compute_sample_weights(y: pd.Series) -> np.ndarray:
@@ -160,15 +210,35 @@ def add_basic_features(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def add_profile_features(df: pd.DataFrame, cadastral: pd.DataFrame, info: pd.DataFrame) -> pd.DataFrame:
-    out = df.merge(cadastral, on="ID_CLIENTE", how="left").merge(info, on=["ID_CLIENTE", "SAFRA_REF"], how="left")
+    out = df.copy()
+    out["_ROW_ORDER"] = np.arange(len(out))
+    out = out.merge(
+        cadastral, on="ID_CLIENTE", how="left", validate="many_to_one", indicator="_CADASTRO_MERGE", sort=False
+    ).merge(
+        info,
+        on=["ID_CLIENTE", "SAFRA_REF"],
+        how="left",
+        validate="many_to_one",
+        indicator="_INFO_MERGE",
+        sort=False,
+    )
+    if len(out) != len(df):
+        raise ValueError("Os joins cadastral/mensal alteraram a quantidade de cobrancas")
+    out = out.sort_values("_ROW_ORDER").drop(columns="_ROW_ORDER").reset_index(drop=True)
     out["DATA_CADASTRO"] = pd.to_datetime(out["DATA_CADASTRO"], errors="coerce")
     out["DDD_NUM"] = pd.to_numeric(out["DDD"], errors="coerce")
-    out["REGIAO"] = out["DDD_NUM"].round().astype("Int64").map(DDD_REGIAO)
+    ddd_valido = out["DDD_NUM"].isin(DDD_REGIAO)
+    out["DDD_AUSENTE"] = out["DDD"].isna().astype(int)
+    out["DDD_INVALIDO"] = (out["DDD"].notna() & ~ddd_valido).astype(int)
+    out["DDD"] = out["DDD_NUM"].where(ddd_valido).map(lambda value: f"{value:.0f}" if pd.notna(value) else "DESCONHECIDO")
+    out["REGIAO"] = out["DDD_NUM"].where(ddd_valido).round().astype("Int64").map(DDD_REGIAO)
     out["DIAS_COMO_CLIENTE"] = (out["DATA_EMISSAO_DOCUMENTO"] - out["DATA_CADASTRO"]).dt.days
     out["CADASTRO_ATIPICO"] = (out["DIAS_COMO_CLIENTE"] < 0).astype(int)
     out["DIAS_COMO_CLIENTE"] = out["DIAS_COMO_CLIENTE"].clip(lower=0)
-    out["CADASTRO_AUSENTE"] = out["DATA_CADASTRO"].isna().astype(int)
-    out["INFO_MENSAL_AUSENTE"] = out["RENDA_MES_ANTERIOR"].isna().astype(int)
+    out["CADASTRO_AUSENTE"] = (out["_CADASTRO_MERGE"] == "left_only").astype(int)
+    out["INFO_MENSAL_AUSENTE"] = (out["_INFO_MERGE"] == "left_only").astype(int)
+    out["RENDA_AUSENTE"] = out["RENDA_MES_ANTERIOR"].isna().astype(int)
+    out["FUNCIONARIOS_AUSENTE"] = out["NO_FUNCIONARIOS"].isna().astype(int)
     out["RENDA_LOG"] = np.log1p(out["RENDA_MES_ANTERIOR"].clip(lower=0))
     out["FUNCIONARIOS_LOG"] = np.log1p(out["NO_FUNCIONARIOS"].clip(lower=0))
 
@@ -185,8 +255,7 @@ def add_profile_features(df: pd.DataFrame, cadastral: pd.DataFrame, info: pd.Dat
     # "cliente e pessoa fisica" com "empresa sem segmento cadastrado" na mesma
     # categoria "DESCONHECIDO".
     out.loc[is_pf, "SEGMENTO_INDUSTRIAL"] = "NAO_APLICAVEL_PF"
-
-    return out
+    return out.drop(columns=["_CADASTRO_MERGE", "_INFO_MERGE"])
 
 
 def add_derived_features(df: pd.DataFrame) -> pd.DataFrame:
@@ -336,6 +405,10 @@ NUMERIC_FEATURES = [
     "CADASTRO_ATIPICO",
     "CADASTRO_AUSENTE",
     "INFO_MENSAL_AUSENTE",
+    "RENDA_AUSENTE",
+    "FUNCIONARIOS_AUSENTE",
+    "DDD_AUSENTE",
+    "DDD_INVALIDO",
     "N_COBRANCAS_ANTERIORES",
     "N_INADIMPLENCIAS_ANTERIORES",
     "SAFRAS_OBSERVADAS_ANTERIORES",
@@ -400,7 +473,7 @@ def make_hgb_pipeline(config: dict, calibrated: bool = False) -> Pipeline:
         random_state=RANDOM_STATE,
     )
     if calibrated:
-        model: object = CalibratedClassifierCV(hgb, method="isotonic", cv=3)
+        model: object = CalibratedClassifierCV(hgb, method="isotonic", cv=TimeSeriesSplit(n_splits=3))
     else:
         model = hgb
     return Pipeline([("prep", make_preprocessor(scale_numeric=False)), (MODEL_STEP_NAME, model)])
@@ -410,7 +483,7 @@ def make_logistic_pipeline() -> Pipeline:
     return Pipeline(
         [
             ("prep", make_preprocessor(scale_numeric=True)),
-            (MODEL_STEP_NAME, LogisticRegression(max_iter=1000, class_weight="balanced", random_state=RANDOM_STATE)),
+            (MODEL_STEP_NAME, LogisticRegression(max_iter=1000, class_weight=None, random_state=RANDOM_STATE)),
         ]
     )
 
@@ -432,21 +505,37 @@ def fit_model(model: Pipeline, x_train: pd.DataFrame, y_train: pd.Series, use_sa
 def evaluate_model(name: str, model: Pipeline, x_valid: pd.DataFrame, y_valid: pd.Series) -> dict[str, float | str]:
     proba = model.predict_proba(x_valid)[:, 1]
     auc = roc_auc_score(y_valid, proba)
+    brier = brier_score_loss(y_valid, proba)
+    prevalence = float(y_valid.mean())
+    reference_brier = prevalence * (1 - prevalence)
     return {
         "modelo": name,
         "auc": auc,
         "gini": 2 * auc - 1,
         "ks": ks_statistic(y_valid, proba),
-        "brier": brier_score_loss(y_valid, proba),
+        "average_precision": average_precision_score(y_valid, proba),
+        "brier": brier,
+        "brier_skill": 1 - brier / reference_brier if reference_brier > 0 else float("nan"),
+        "log_loss": log_loss(y_valid, proba, labels=[0, 1]),
         "prob_media": float(proba.mean()),
-        "target_medio": float(y_valid.mean()),
+        "target_medio": prevalence,
     }
 
 
 def temporal_split(df: pd.DataFrame, validation_months: Iterable[str] = VALIDATION_MONTHS):
-    valid_mask = df["SAFRA_REF"].isin(list(validation_months))
-    train_df = df.loc[~valid_mask].copy()
+    months = sorted(set(validation_months))
+    if not months:
+        raise ValueError("validation_months nao pode ser vazio")
+    valid_mask = df["SAFRA_REF"].isin(months)
+    train_mask = df["SAFRA_REF"] < months[0]
+    unexpected = ~(valid_mask | train_mask)
+    if unexpected.any():
+        future_months = sorted(df.loc[unexpected, "SAFRA_REF"].unique())
+        raise ValueError(f"Safras posteriores ou lacunas fora da validacao: {future_months}")
+    train_df = df.loc[train_mask].copy()
     valid_df = df.loc[valid_mask].copy()
+    if train_df.empty or valid_df.empty:
+        raise ValueError("Treino e validacao temporal precisam conter observacoes")
     return train_df, valid_df
 
 
@@ -464,6 +553,8 @@ def prepare_validation_tables(
     valid = add_profile_features(valid, cadastral, info)
     train = add_derived_features(train)
     valid = add_derived_features(valid)
+    train = train.sort_values(["SAFRA_REF", "DATA_EMISSAO_DOCUMENTO"]).reset_index(drop=True)
+    valid = valid.sort_values(["SAFRA_REF", "DATA_EMISSAO_DOCUMENTO"]).reset_index(drop=True)
     return train, valid
 
 
@@ -507,7 +598,7 @@ def print_quality_summary(dev: pd.DataFrame, test: pd.DataFrame) -> None:
 
 
 def print_feature_importance(model: Pipeline, x_valid: pd.DataFrame, y_valid: pd.Series, top_n: int = 10) -> None:
-    print("\nImportancia por permutacao (top 10)")
+    print("\nImportancia por permutacao em Brier Score (top 10)")
     sample_n = min(3000, len(x_valid))
     sample_idx = x_valid.sample(n=sample_n, random_state=RANDOM_STATE).index
     x_sample = x_valid.loc[sample_idx]
@@ -519,11 +610,27 @@ def print_feature_importance(model: Pipeline, x_valid: pd.DataFrame, y_valid: pd
         n_repeats=5,
         random_state=RANDOM_STATE,
         n_jobs=1,
+        scoring="neg_brier_score",
     )
     ranking = pd.DataFrame({"feature": FEATURE_COLUMNS, "importance": result.importances_mean}).sort_values(
         "importance", ascending=False
     )
     print(ranking.head(top_n).to_string(index=False, float_format=lambda x: f"{x:.5f}"))
+
+
+def print_monthly_metrics(model: Pipeline, valid_df: pd.DataFrame) -> None:
+    """Explicita degradacao temporal que a metrica agregada pode esconder."""
+    rows = []
+    for month, group in valid_df.groupby("SAFRA_REF", sort=True):
+        metrics = evaluate_model(
+            str(month), model, group[FEATURE_COLUMNS], group["INADIMPLENTE"]
+        )
+        metrics["safra"] = month
+        metrics["n"] = len(group)
+        rows.append(metrics)
+    columns = ["safra", "n", "target_medio", "prob_media", "auc", "ks", "average_precision", "brier"]
+    print("\nMetricas por safra de validacao")
+    print(pd.DataFrame(rows)[columns].to_string(index=False, float_format=lambda x: f"{x:.4f}"))
 
 
 # ============================================================
@@ -618,6 +725,8 @@ def main() -> None:
 
     final_model = candidate_models[best_name]
 
+    print_monthly_metrics(final_model, valid_df)
+
     # A importancia por permutacao usa o modelo tal como foi avaliado na validacao
     # (ajustado so em x_train, ate 2021-02). Isso e proposital: x_valid (2021-03 a
     # 2021-06) faz parte do `dev` usado no refit final logo abaixo, entao calcular
@@ -644,3 +753,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
